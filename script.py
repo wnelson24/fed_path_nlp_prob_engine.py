@@ -1,22 +1,17 @@
 """
 Fed-Path Probability Engine With NLP Headline Shock Detection
+Workspace RDP Version (rd.open_session)
 Author: William Nelson
-Purpose: Reconstruct policy-path probabilities from OIS/FedFunds
-         and map headline sentiment to repricing in terminal and 
-         cut-path probability distributions.
-
-Requirements:
-- Refinitiv Eikon API
-- numpy, pandas, scipy
-- sklearn (for logistic regression placeholder)
-- nltk or transformers (optional for stronger NLP)
+Purpose:
+    Reconstruct policy-path probabilities from OIS/FedFunds
+    and map headline sentiment to repricing in terminal and
+    cut-path probability distributions.
 """
 
 # ============================================================
 # 0. IMPORTS
 # ============================================================
 
-import eikon as ek
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -24,14 +19,15 @@ from scipy.optimize import minimize
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 
-# OPTIONAL: you can uncomment and use transformers for stronger NLP
-# from transformers import pipeline
+import rd as rdp    # Workspace RDP client (no AppKey required)
+
 
 # ============================================================
-# 1. CONNECT EIKON
+# 1. CONNECT WORKSPACE
 # ============================================================
 
-ek.set_app_key("YOUR_APP_KEY_HERE")
+# This authenticates using your Refinitiv Workspace desktop login
+rdp.open_session()
 
 
 # ============================================================
@@ -40,33 +36,32 @@ ek.set_app_key("YOUR_APP_KEY_HERE")
 
 def fetch_fed_funds_chain():
     """
-    Pulls the entire FF futures chain.
-    Fn: Price -> Implied Rate -> Meeting Probability Extraction
+    Pulls the FF futures chain (0#FF:).
+    Returns last prices and implied rates.
     """
     chain = "0#FF:"
     fields = ["TRDPRC_1", "BID", "ASK", "HIGH_1", "LOW_1"]
-    df, err = ek.get_data(chain, fields)
-    if err:
-        raise ValueError(err)
+
+    df = rdp.get_data(universe=[chain], fields=fields).data.df
     df = df.dropna(subset=["TRDPRC_1"])
+
     return df
 
 
 def fetch_ois_curve():
     """
-    Fetch short-dated OIS:
+    Fetch OIS curve points:
     1M, 3M, 6M, 1Y, 2Y, 5Y
     """
-    instruments = ["USOIS1M=", "USOIS3M=", "USOIS6M=", 
+
+    instruments = ["USOIS1M=", "USOIS3M=", "USOIS6M=",
                    "USOIS1Y=", "USOIS2Y=", "USOIS5Y="]
 
-    fields = ["TR.Mid"]
-    df, err = ek.get_data(instruments, fields)
-    if err:
-        raise ValueError(err)
-
+    df = rdp.get_data(universe=instruments, fields=["TR.Mid"]).data.df
     df = df.set_index("Instrument")
-    return df["Mid"] / 100  # convert to decimals
+
+    # Convert from % to decimal rate
+    return df["TR.Mid"] / 100
 
 
 # ============================================================
@@ -75,31 +70,25 @@ def fetch_ois_curve():
 
 def implied_rate_from_future(price):
     """
-    Fed Funds futures settle at: 100 - implied rate.
+    Fed Funds futures settle at 100 - implied rate.
     """
     return (100 - price) / 100
 
 
 def extract_meeting_probabilities(ff_df):
     """
-    Using a simple 2-state model (0bp vs 25bp move) to extract
-    implied probabilities from nearest FF future contract.
-    (You can expand to multi-state if you like.)
+    A simple 2-state model:
+        0bp move vs +25bp move.
     """
-    # Take nearest contract
-    row = ff_df.iloc[0]
-    implied = implied_rate_from_future(row["TRDPRC_1"])
+    nearest = ff_df.iloc[0]
+    implied = implied_rate_from_future(nearest["TRDPRC_1"])
 
-    # Set reference (example: assume current effective rate = 5.33%)
+    # Example effective rate assumption:
     current_rate = 5.33 / 100
-
-    # Solve for p such that:
-    # implied = p*(current+0.25%) + (1-p)*(current)
     hike_size = 0.25 / 100
-    if implicit := (implied - current_rate) / hike_size:
-        p_hike = max(0, min(implicit, 1))
-    else:
-        p_hike = 0.0
+
+    raw = (implied - current_rate) / hike_size
+    p_hike = max(0, min(raw, 1)) if hike_size != 0 else 0
 
     return {
         "meeting_implied": implied,
@@ -110,14 +99,12 @@ def extract_meeting_probabilities(ff_df):
 
 def terminal_rate_from_ois(ois_curve):
     """
-    Terminal rate approximation:
-    Use the 1Y–2Y OIS portion as proxy for terminal pricing midpoint.
+    Terminal rate ~ midpoint of 1Y and 2Y OIS.
     """
     one_y = float(ois_curve["USOIS1Y="])
     two_y = float(ois_curve["USOIS2Y="])
 
-    terminal = (one_y + two_y) / 2
-    return terminal
+    return (one_y + two_y) / 2
 
 
 # ============================================================
@@ -126,42 +113,31 @@ def terminal_rate_from_ois(ois_curve):
 
 def fetch_fed_related_headlines(limit=20):
     """
-    Pulls recent Fed-related Reuters headlines.
-    Search fields: 'Powell', 'FOMC', 'Fed', 'inflation'
+    Pull Reuters Fed-related headlines via RDP.
     """
-    news, err = ek.news_headlines(query="Fed OR Powell OR FOMC", count=limit)
-    if err:
-        raise ValueError(err)
+    news = rdp.get_news_headlines(query="Fed OR Powell OR FOMC", count=limit).data.df
     return news
 
 
 def fetch_story_text(story_id):
     """
-    Fetch full story text.
+    Fetch full Reuters story text via RDP.
     """
-    story, err = ek.news_story(story_id)
-    if err:
+    try:
+        return rdp.get_news_story(story_id).data["story"]
+    except Exception:
         return ""
-    return story
 
 
 def classify_headlines(headlines):
     """
-    Simple NLP classifier using TF-IDF + Logistic Regression placeholder.
-    You may replace with transformer for stronger performance.
-
-    Labels (conceptually):
-    - hawkish = +1
-    - dovish = -1
+    Simple TF-IDF + Logistic Regression placeholder.
+    Produces a sentiment score ∈ [-0.5, +0.5].
     """
 
-    texts = []
-    for _, row in headlines.iterrows():
-        sid = row["storyId"]
-        texts.append(fetch_story_text(sid))
+    texts = [fetch_story_text(sid) for sid in headlines["storyId"]]
 
-    # Dummy labels: assume half hawkish, half dovish for now.
-    # Replace with your own training dataset.
+    # Dummy labels (replace with real dataset later)
     labels = np.array([1 if i % 2 == 0 else -1 for i in range(len(texts))])
 
     vectorizer = TfidfVectorizer(stop_words="english", max_features=500)
@@ -170,9 +146,8 @@ def classify_headlines(headlines):
     clf = LogisticRegression()
     clf.fit(X, labels)
 
-    sentiment_scores = clf.predict_proba(X)[:, 1] - 0.5  # [-0.5, +0.5]
-
-    return sentiment_scores.mean()
+    sentiment = clf.predict_proba(X)[:, 1] - 0.5
+    return sentiment.mean()
 
 
 # ============================================================
@@ -181,54 +156,53 @@ def classify_headlines(headlines):
 
 def map_shock_to_repricing(hawkish_score, prob_dict, terminal_rate):
     """
-    Maps headline sentiment -> repricing of terminal and cut-path.
-    A simple linear model which you can calibrate on history.
+    Maps the NLP hawkish/dovish sentiment → repriced probabilities & terminal rate.
     """
 
-    # Baseline
     ph = prob_dict["prob_hike_25bp"]
-    pc = prob_dict["prob_cut_25bp"]
 
-    # shock amplification
-    delta = hawkish_score * 0.15  # slope to tune
-    new_ph = min(max(ph + delta, 0), 1)
+    # Amplifier (tunables)
+    dP = hawkish_score * 0.15
+    dT = hawkish_score * 0.10   # 10bp per 1.0 hawkish score
+
+    new_ph = np.clip(ph + dP, 0, 1)
     new_pc = 1 - new_ph
-
-    # terminal repricing
-    d_terminal = hawkish_score * 0.10  # 10bps for strong sentiment
 
     return {
         "new_prob_hike": new_ph,
         "new_prob_cut": new_pc,
-        "repriced_terminal": terminal_rate + d_terminal
+        "repriced_terminal": terminal_rate + dT
     }
 
 
 # ============================================================
-# 6. INTEGRATED ENGINE
+# 6. INTEGRATED FED-PATH ENGINE
 # ============================================================
 
 def run_fed_path_engine():
-    print("\n--- FED PATH PROBABILITY & NLP SHOCK ENGINE ---\n")
 
-    # 1. Fetch data
+    print("\n--- FED PATH PROBABILITY & NLP SHOCK ENGINE (Workspace RDP Version) ---\n")
+
+    # 1. Data
     ff = fetch_fed_funds_chain()
     ois = fetch_ois_curve()
 
-    # 2. Extract probabilities
+    # 2. Probabilities
     prob = extract_meeting_probabilities(ff)
 
     # 3. Terminal rate
     terminal = terminal_rate_from_ois(ois)
 
-    # 4. Recent headlines + sentiment
+    # 4. NLP sentiment from Reuters headlines
     headlines = fetch_fed_related_headlines(limit=10)
     hawkishness = classify_headlines(headlines)
 
     # 5. Repricing
-    mapped = map_shock_to_repricing(hawkishness, prob, terminal)
+    adj = map_shock_to_repricing(hawkishness, prob, terminal)
 
-    # 6. Output
+    # ----------------------
+    # OUTPUT
+    # ----------------------
     print(f"Implied Meeting Rate: {prob['meeting_implied']:.3%}")
     print(f"Prob Hike 25bp:       {prob['prob_hike_25bp']:.1%}")
     print(f"Prob Cut 25bp:        {prob['prob_cut_25bp']:.1%}\n")
@@ -237,9 +211,9 @@ def run_fed_path_engine():
     print(f"Hawkishness Score:    {hawkishness:.3f}\n")
 
     print("--- NLP-Adjusted Repricing ---")
-    print(f"Repriced Hike Prob:   {mapped['new_prob_hike']:.1%}")
-    print(f"Repriced Cut Prob:    {mapped['new_prob_cut']:.1%}")
-    print(f"Repriced Terminal:    {mapped['repriced_terminal']:.3%}\n")
+    print(f"Repriced Hike Prob:   {adj['new_prob_hike']:.1%}")
+    print(f"Repriced Cut Prob:    {adj['new_prob_cut']:.1%}")
+    print(f"Repriced Terminal:    {adj['repriced_terminal']:.3%}\n")
 
     print("--- END ---\n")
 
